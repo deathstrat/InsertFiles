@@ -1,0 +1,224 @@
+--[[
+    ╔══════════════════════════════════════════════════════╗
+    ║              ICY HUB — ANTI-AFK MODULE               ║
+    ║        Prevents Roblox 20-minute idle kick           ║
+    ║   Uses VirtualUser + Idled event dual-layer system   ║
+    ╚══════════════════════════════════════════════════════╝
+]]
+
+-- ═══════════════════════════════════════════
+--  SERVICES
+-- ═══════════════════════════════════════════
+local Players        = game:GetService("Players")
+local VirtualUser    = game:GetService("VirtualUser")
+
+-- ═══════════════════════════════════════════
+--  REFERENCES
+-- ═══════════════════════════════════════════
+local LocalPlayer = Players.LocalPlayer
+
+-- ═══════════════════════════════════════════
+--  CONFIGURATION
+-- ═══════════════════════════════════════════
+local Config = {
+    --  Randomized delay range (seconds) between each simulated input.
+    --  Avoid round numbers to reduce pattern detectability.
+    MinDelay = 55,
+    MaxDelay = 105,
+
+    --  If true, skip simulation when the player is already moving.
+    --  Prevents micro-interference with active movement.
+    SkipIfMoving = true,
+
+    --  Velocity magnitude threshold for "is moving" check.
+    MovementThreshold = 0.5,
+
+    --  Set false if you want it disabled on initial load.
+    AutoStart = true,
+}
+
+-- ═══════════════════════════════════════════
+--  MODULE TABLE
+-- ═══════════════════════════════════════════
+local AntiAFK = {
+    _running    = false,
+    _thread     = nil,
+    _idleConn   = nil,
+    _totalFires = 0,
+}
+
+-- ═══════════════════════════════════════════
+--  PRIVATE UTILITIES
+-- ═══════════════════════════════════════════
+
+--- Returns a random float between [min, max].
+--- Randomization breaks fixed-interval detection.
+local function randomDelay(): number
+    return Config.MinDelay + math.random() * (Config.MaxDelay - Config.MinDelay)
+end
+
+--- Checks if the local character's root is currently in motion.
+--- Avoids interfering with active players or cutscene-controlled characters.
+local function isPlayerMoving(): boolean
+    if not Config.SkipIfMoving then return false end
+
+    local char = LocalPlayer.Character
+    if not char then return false end
+
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    -- AssemblyLinearVelocity is the accurate physics velocity on the part
+    return root.AssemblyLinearVelocity.Magnitude > Config.MovementThreshold
+end
+
+--- Core input simulation.
+--- VirtualUser:CaptureController() is the primary anti-AFK call —
+--- it tells Roblox's idle system that a controller input has occurred,
+--- resetting the internal idle timer that triggers the 20-min kick.
+local function simulateInput()
+    -- PRIMARY: resets Roblox idle timer
+    VirtualUser:CaptureController()
+
+    -- SECONDARY: simulate a mouse button tap at (0, 0) in screen space.
+    -- This acts as a redundant input signal. The position doesn't matter
+    -- for idle detection — just that an input event was fired.
+    local cam = workspace.CurrentCamera
+    if cam then
+        VirtualUser:Button1Down(Vector2.zero, cam.CFrame)
+        task.wait(0.08 + math.random() * 0.07) -- randomized tiny hold: 80–150ms
+        VirtualUser:Button1Up(Vector2.zero, cam.CFrame)
+    end
+
+    AntiAFK._totalFires += 1
+end
+
+-- ═══════════════════════════════════════════
+--  LAYER 1 — PERIODIC SIMULATION LOOP
+-- ═══════════════════════════════════════════
+--- Runs on its own thread. Sleeps for a randomized interval,
+--- wakes up and fires a simulated input if conditions are met.
+--- Wrapped in pcall so errors never silently kill the loop.
+local function afkLoop()
+    while AntiAFK._running do
+        local ok, err = pcall(function()
+
+            -- Re-check character each iteration (handles respawns)
+            if not LocalPlayer.Character then
+                task.wait(2)
+                return
+            end
+
+            if not isPlayerMoving() then
+                simulateInput()
+            end
+
+        end)
+
+        if not ok then
+            warn(("[Anti-AFK] Loop error (will retry): %s"):format(tostring(err)))
+        end
+
+        -- Sleep for a randomized duration before next fire.
+        -- Keeps CPU usage near zero between fires.
+        task.wait(randomDelay())
+    end
+end
+
+-- ═══════════════════════════════════════════
+--  LAYER 2 — IDLED EVENT HARD CATCH
+-- ═══════════════════════════════════════════
+--- Roblox fires LocalPlayer.Idled roughly every 2 minutes after
+--- the idle threshold is crossed (~18–20 min of no input).
+--- This is a dedicated backstop: even if the loop somehow slips,
+--- the Idled event fires before the actual kick, giving us one
+--- last chance to reset. Layer 1 should prevent this from ever
+--- firing, but defense in depth costs nothing.
+local function connectIdledEvent()
+    -- Disconnect existing if reconnecting
+    if AntiAFK._idleConn then
+        AntiAFK._idleConn:Disconnect()
+    end
+
+    AntiAFK._idleConn = LocalPlayer.Idled:Connect(function()
+        if not AntiAFK._running then return end
+
+        -- Hard reset on the Idled signal
+        VirtualUser:CaptureController()
+        warn("[Anti-AFK] ⚠ Idled event caught — emergency reset fired.")
+    end)
+end
+
+-- ═══════════════════════════════════════════
+--  PUBLIC API
+-- ═══════════════════════════════════════════
+
+--- Enable Anti-AFK. Starts the loop and the Idled listener.
+function AntiAFK:Start()
+    if self._running then
+        warn("[Anti-AFK] Already active.")
+        return
+    end
+
+    self._running    = true
+    self._totalFires = 0
+
+    -- Connect the Idled hard-catch (Layer 2)
+    connectIdledEvent()
+
+    -- Spawn the periodic loop on a managed thread (Layer 1)
+    self._thread = task.spawn(afkLoop)
+
+    print(("[Anti-AFK] ✅ Started | Interval: %ds – %ds"):format(
+        Config.MinDelay, Config.MaxDelay
+    ))
+end
+
+--- Disable Anti-AFK. Cancels the loop and disconnects the listener.
+function AntiAFK:Stop()
+    if not self._running then
+        warn("[Anti-AFK] Not active.")
+        return
+    end
+
+    self._running = false
+
+    -- Cancel the worker thread cleanly
+    if self._thread then
+        task.cancel(self._thread)
+        self._thread = nil
+    end
+
+    -- Disconnect the Idled event listener
+    if self._idleConn then
+        self._idleConn:Disconnect()
+        self._idleConn = nil
+    end
+
+    print(("[Anti-AFK] 🛑 Stopped | Total inputs simulated: %d"):format(
+        self._totalFires
+    ))
+end
+
+--- Toggle between active and inactive states.
+function AntiAFK:Toggle()
+    if self._running then
+        self:Stop()
+    else
+        self:Start()
+    end
+end
+
+--- Returns whether Anti-AFK is currently active.
+function AntiAFK:IsActive(): boolean
+    return self._running
+end
+
+-- ═══════════════════════════════════════════
+--  INIT
+-- ═══════════════════════════════════════════
+if Config.AutoStart then
+    AntiAFK:Start()
+end
+
+return AntiAFK
